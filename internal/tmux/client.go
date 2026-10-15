@@ -238,8 +238,10 @@ func findInstalledTmuxBinaryPath() string {
 
 func findStandardTmuxBinaryPath() string {
 	candidates := []string{
-		"/usr/bin/tmux",
+		// Prefer a newer custom build over the distro binary. A stale
+		// /usr/bin/tmux (e.g. 3.4) cannot talk to a newer server socket.
 		"/usr/local/bin/tmux",
+		"/usr/bin/tmux",
 		"/opt/homebrew/bin/tmux",
 		"/bin/tmux",
 	}
