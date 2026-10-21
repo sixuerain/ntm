@@ -33,6 +33,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -103,6 +104,9 @@ type AccountFailoverOptions struct {
 	Config                 *config.Config
 	Targets                map[string]AccountFailoverTarget
 	ForceGlobalAuthClobber bool
+	// ValidateScope must re-observe the original session and launched panes.
+	// It must not infer identity from a name or a cached polling observation.
+	ValidateScope func(context.Context) error
 }
 
 // AccountFailoverMonitor exposes the coordinator's existing decision engine to
@@ -116,9 +120,13 @@ func NewAccountFailoverMonitor(session string, opts AccountFailoverOptions) (*Ac
 	if opts.Config == nil || !opts.Config.Integrations.CAAM.AutoFailover || len(opts.Targets) == 0 {
 		return nil, errors.New("account failover requires enabled configuration and explicit pane targets")
 	}
+	if opts.ValidateScope == nil {
+		return nil, errors.New("account failover requires a live original-session scope guard")
+	}
 	fc := newFailoverChecker(session, "", opts.Config.Integrations.CAAM)
 	fc.config = opts.Config
 	fc.forceGlobal = opts.ForceGlobalAuthClobber
+	fc.validateScope = opts.ValidateScope
 	fc.targets = make(map[string]AccountFailoverTarget, len(opts.Targets))
 	for paneID, target := range opts.Targets {
 		if !regexp.MustCompile(`^%[0-9]+$`).MatchString(paneID) || !filepath.IsAbs(target.ProjectDir) ||
@@ -190,13 +198,14 @@ func PreflightAccountRotation(ctx context.Context, cfg config.CAAMConfig) error 
 // collaborators are injectable for tests; production wiring is installed by
 // newFailoverChecker.
 type failoverChecker struct {
-	session     string
-	workDir     string
-	config      *config.Config
-	forceGlobal bool
-	targets     map[string]AccountFailoverTarget
-	horizon     time.Duration
-	providers   map[string]bool // canonical caam provider allow-list
+	validateScope func(context.Context) error // resident session-generation guard
+	session       string
+	workDir       string
+	config        *config.Config
+	forceGlobal   bool
+	targets       map[string]AccountFailoverTarget
+	horizon       time.Duration
+	providers     map[string]bool // canonical caam provider allow-list
 
 	// Seams (default to real implementations).
 	getPanes               func(context.Context, string) ([]tmux.Pane, error)
@@ -286,10 +295,9 @@ func newFailoverChecker(session, workDir string, caamCfg config.CAAMConfig) *fai
 			out, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
 			return strings.TrimSuffix(out, "\n"), err
 		},
-		readSpec:       tmux.ReadPaneLaunchSpecContext,
-		observeBinding: agentsession.ObserveGlobalCredentialBinding,
-		restartPane:    robot.GetRestartPaneContext,
-		lockProvider:   acquireFailoverProviderLock,
+		readSpec:     tmux.ReadPaneLaunchSpecContext,
+		restartPane:  robot.GetRestartPaneContext,
+		lockProvider: acquireFailoverProviderLock,
 		publish: func(record robot.ActuationRecord) {
 			robot.GetAttentionFeed().PublishActuation(record)
 		},
@@ -298,6 +306,11 @@ func newFailoverChecker(session, workDir string, caamCfg config.CAAMConfig) *fai
 		lastPublished: make(map[string]declineMark),
 	}
 	fc.lastSwitchAt = fc.storedLastSwitch
+	fc.observeBinding = func(ctx context.Context, agentType, workDir string, panePID int) (agentsession.GlobalCredentialBinding, error) {
+		return agentsession.ObserveGlobalCredentialBinding(ctx, agentType, workDir, panePID, agentsession.ResumeLaunchOptions{
+			TrustedClaudeSettings: policy.ClaudeAgentLaunchSettings(fc.config).Settings,
+		})
+	}
 	fc.claimSwitch = fc.storeLastSwitch
 	fc.guardSwitch = fc.guardPaneSwitch
 	fc.recoverPane = fc.recoverLimitedPane
@@ -554,6 +567,9 @@ func sameRecoveryPane(expected, actual tmux.Pane) bool {
 
 func (fc *failoverChecker) observeRecoveryPane(ctx context.Context, expected tmux.Pane, saved *tmux.AgentLaunchSpec, cwd string) (tmux.AgentLaunchSpec, string, error) {
 	var empty tmux.AgentLaunchSpec
+	if err := fc.validateRecoveryScope(ctx); err != nil {
+		return empty, "", err
+	}
 	panes, err := fc.getPanes(ctx, fc.session)
 	if err != nil {
 		return empty, "", err
@@ -584,7 +600,7 @@ func (fc *failoverChecker) observeRecoveryPane(ctx context.Context, expected tmu
 	if spec.CAAMProfile != "" || spec.ClaudeIsolateCredentials || spec.ClaudeTokenFile != "" || len(spec.OmittedEnv) != 0 {
 		return empty, "", errors.New("pane does not use replayable global credentials")
 	}
-	if err := agentsession.ValidateGlobalCredentialLaunchCommand(string(expected.Type), spec.Command, agentsession.ResumeLaunchOptions{SystemPromptFile: spec.SystemPromptFile}); err != nil {
+	if err := agentsession.ValidateGlobalCredentialLaunchCommand(string(expected.Type), spec.Command, agentsession.ResumeLaunchOptions{SystemPromptFile: spec.SystemPromptFile, TrustedClaudeSettings: policy.ClaudeAgentLaunchSettings(fc.config).Settings}); err != nil {
 		return empty, "", err
 	}
 	if saved != nil && !reflect.DeepEqual(*saved, *spec) {
@@ -611,10 +627,20 @@ func (fc *failoverChecker) observeRecoveryPane(ctx context.Context, expected tmu
 	if err := fc.guardSwitch(ctx, expected, providerForAgentType(expected.Type.Canonical())); err != nil {
 		return empty, "", err
 	}
-	if err := ctx.Err(); err != nil {
+	if err := fc.validateRecoveryScope(ctx); err != nil {
 		return empty, "", err
 	}
 	return *spec, dir, nil
+}
+
+func (fc *failoverChecker) validateRecoveryScope(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if fc.validateScope != nil {
+		return fc.validateScope(ctx)
+	}
+	return nil
 }
 
 func sameRecoveryBinding(a, b agentsession.GlobalCredentialBinding) bool {
@@ -710,7 +736,9 @@ func (fc *failoverChecker) recoverLimitedPane(ctx context.Context, pane tmux.Pan
 				if err := fc.writeProviderWatermark(watermarkTypeCaamProviderAttempt, provider, request.Account, fc.now()); err != nil {
 					return err
 				}
-				if err := finalCtx.Err(); err != nil {
+				// Durable writes above can block. Re-observe the session at the
+				// last boundary before CAAM is allowed to mutate global credentials.
+				if err := fc.validateRecoveryScope(finalCtx); err != nil {
 					return err
 				}
 				out.ActivationAttempted = true
@@ -778,6 +806,9 @@ func (fc *failoverChecker) recoverLimitedPane(ctx context.Context, pane tmux.Pan
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if err := fc.validateRecoveryScope(verifyCtx); err != nil {
+			return out, err
+		}
 		panes, err := fc.getPanes(verifyCtx, fc.session)
 		if err != nil {
 			return out, err
@@ -839,6 +870,9 @@ func (fc *failoverChecker) recoverLimitedPane(ctx context.Context, pane tmux.Pan
 			}
 			if !confirmed {
 				return out, errors.New("replacement pane changed during account confirmation")
+			}
+			if err := fc.validateRecoveryScope(verifyCtx); err != nil {
+				return out, err
 			}
 			out.ConversationRecovered = true
 			return out, nil

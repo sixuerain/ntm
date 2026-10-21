@@ -14,6 +14,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -255,6 +256,135 @@ func newAccountRecoveryFixture(t *testing.T, count int) *accountRecoveryFixture 
 	}
 	fc.recoverPane = fc.recoverLimitedPane
 	return f
+}
+
+func TestAccountFailoverMonitorRechecksResidentScopeAtMutationBoundaries(t *testing.T) {
+	for _, boundary := range []string{"unchanged", "inventory", "activation", "durable_attempt", "after_activation", "confirmation"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newAccountRecoveryFixture(t, 1)
+			fc := f.monitor.checker
+			live, checks := true, 0
+			fc.validateScope = func(context.Context) error {
+				checks++
+				if !live {
+					return errors.New("original session was replaced")
+				}
+				return nil
+			}
+			switch boundary {
+			case "inventory":
+				f.queryHook = func() { live = false }
+			case "activation":
+				f.activationHook = func() { live = false }
+			case "durable_attempt":
+				write := fc.writeProviderWatermark
+				fc.writeProviderWatermark = func(kind, provider, account string, at time.Time) error {
+					err := write(kind, provider, account, at)
+					if kind == watermarkTypeCaamProviderAttempt {
+						live = false
+					}
+					return err
+				}
+			case "after_activation":
+				f.queryHook = func() {
+					if f.activated > 0 {
+						live = false
+					}
+				}
+			case "confirmation":
+				observe := fc.observeBinding
+				fc.observeBinding = func(ctx context.Context, agentType, workDir string, pid int) (agentsession.GlobalCredentialBinding, error) {
+					proof, err := observe(ctx, agentType, workDir, pid)
+					if f.respawned > 0 {
+						live = false
+					}
+					return proof, err
+				}
+			}
+			decisions := f.monitor.RunOnce(t.Context())
+			if checks == 0 || len(decisions) != 1 {
+				t.Fatalf("scope not checked: checks=%d decisions=%+v", checks, decisions)
+			}
+			if boundary == "unchanged" {
+				if !decisions[0].ConversationRecovered || f.activated != 1 || f.respawned != 1 {
+					t.Fatalf("valid session refused: %+v", decisions)
+				}
+				return
+			}
+			if decisions[0].ConversationRecovered {
+				t.Fatalf("replacement reported recovered: %+v", decisions)
+			}
+			if boundary != "after_activation" && boundary != "confirmation" && (f.activated != 0 || f.respawned != 0) {
+				t.Fatalf("replacement mutated credentials or pane: activated=%d respawned=%d %+v", f.activated, f.respawned, decisions)
+			}
+			if boundary == "after_activation" && (f.activated != 1 || f.respawned != 0 || !decisions[0].AccountActivated) {
+				t.Fatalf("activation receipt or restart boundary incorrect: %+v", decisions)
+			}
+			if boundary == "confirmation" && (f.activated != 1 || f.respawned != 1 || live) {
+				t.Fatalf("confirmation boundary was not exercised: activated=%d respawned=%d live=%v", f.activated, f.respawned, live)
+			}
+		})
+	}
+}
+
+func TestNewAccountFailoverMonitorRequiresResidentScopeGuard(t *testing.T) {
+	cfg := config.Default()
+	cfg.Integrations.CAAM.AutoFailover = true
+	opts := AccountFailoverOptions{Config: cfg, Targets: map[string]AccountFailoverTarget{"%1": {AgentType: "cc", ProjectDir: t.TempDir()}}}
+	if _, err := NewAccountFailoverMonitor("rotation", opts); err == nil {
+		t.Fatal("resident monitor accepted without a session identity guard")
+	}
+	opts.ValidateScope = func(context.Context) error { return errors.New("replaced") }
+	monitor, err := NewAccountFailoverMonitor("rotation", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer monitor.Close()
+	if err := monitor.checker.validateRecoveryScope(t.Context()); err == nil {
+		t.Fatal("resident guard was not retained")
+	}
+}
+
+func TestAccountFailoverMonitorPreservesTrustedSafetySettings(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		t.Run(fmt.Sprintf("custom=%v", custom), func(t *testing.T) {
+			f := newAccountRecoveryFixture(t, 1)
+			cfg := f.monitor.checker.config
+			cfg.Safety.ClaudePolicyHook = true
+			cfg.Integrations.DCG.Enabled = false
+			cfg.Integrations.RCH.Enabled = true
+			cfg.Integrations.RCH.BinaryPath = filepath.Join(t.TempDir(), "rch")
+			if err := os.WriteFile(cfg.Integrations.RCH.BinaryPath, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			settings := policy.ClaudeAgentLaunchSettings(cfg).Settings
+			if settings == "" || !strings.Contains(settings, "rch") {
+				t.Fatalf("missing integrations: %s", settings)
+			}
+			if custom {
+				settings = `{"apiKeyHelper":"external"}`
+			}
+			for id, spec := range f.specs {
+				spec.Command += " --settings " + tmux.ShellQuote(settings)
+				f.specs[id] = spec
+			}
+			decisions := f.monitor.RunOnce(t.Context())
+			if custom {
+				if f.activated != 0 || f.respawned != 0 {
+					t.Fatalf("custom credentials rotated: %+v", decisions)
+				}
+				return
+			}
+			if len(decisions) != 1 || !decisions[0].ConversationRecovered || f.activated != 1 || f.respawned != 1 {
+				t.Fatalf("trusted recovery failed: %+v", decisions)
+			}
+			for _, spec := range f.specs {
+				if !strings.Contains(spec.Command, tmux.ShellQuote(settings)) || strings.Count(spec.Command, "--resume") != 1 {
+					t.Fatalf("recovery dropped hooks: %s", spec.Command)
+				}
+			}
+		})
+	}
 }
 
 func TestAccountFailoverMonitorRecoversSiblingsWithoutRepeatedGlobalActivation(t *testing.T) {

@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Dicklesworthstone/ntm/internal/reservationpath"
 )
@@ -830,65 +832,87 @@ func (c *Client) ContactHandshake(ctx context.Context, opts ContactHandshakeOpti
 	return &handshakeResult, nil
 }
 
-// SendOverseerMessage sends a Human Overseer message. On mcp-agent-mail
-// >=2.13 (the current server line) this uses the MCP `send_message`
-// tool with a registered `HumanOverseer` agent — the legacy
-// `/mail/{slug}/overseer/send` HTTP endpoint is no longer exposed by
-// many deployments and was returning 404 (#146).
-//
-// The MCP path:
-//
-//  1. Ensures the project exists.
-//  2. Registers a `HumanOverseer` agent (idempotent — re-registering
-//     just refreshes its activity timestamp on the server).
-//  3. Sends via `send_message` with `importance=high`, the configured
-//     thread id, and a `HumanOverseerPreamble` prepended to the body.
-//
-// As a back-compat fallback (older servers that still expose the HTTP
-// endpoint and don't accept `HumanOverseer` as an agent name), if MCP
-// send_message reports the special "human-overseer-not-supported"
-// error path we retry against the HTTP endpoint. Most callers will
-// never hit that branch.
+// SendOverseerMessage uses the server's audited human intervention route.
+// Only a missing route permits a legacy MCP send, using an already provisioned
+// identity. Never register the reserved name, downgrade a rejected intervention,
+// or retry an ambiguous send (which could duplicate delivery).
 func (c *Client) SendOverseerMessage(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
-	// Prefer the MCP path. Need ProjectKey for the MCP tools (the
-	// server-side project_key is an absolute path, not the URL slug).
-	// Legacy callers that only have a ProjectSlug fall through to
-	// the HTTP route and the server validates recipients/subject
-	// shape there.
-	projectKey := opts.ProjectKey
-	if projectKey == "" {
-		return c.sendOverseerMessageHTTP(ctx, opts)
+	invalid := func(message string) (*OverseerSendResult, error) {
+		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %s", ErrInvalidRequest, message))
+	}
+	opts.ProjectSlug = strings.TrimSpace(opts.ProjectSlug)
+	if opts.ProjectSlug == "" && strings.TrimSpace(opts.ProjectKey) == "" {
+		return invalid("project_slug or project_key is required")
+	}
+	if opts.Reason == "" {
+		opts.Reason = DefaultOverseerReason
+	}
+	opts.Reason = strings.TrimSpace(opts.Reason)
+	if !utf8.ValidString(opts.Reason) || opts.Reason == "" || utf8.RuneCountInString(opts.Reason) > MaxOverseerReasonLength {
+		return invalid("intervention reason must contain 1 to 500 valid Unicode characters")
+	}
+	if subject := strings.TrimSpace(opts.Subject); !utf8.ValidString(subject) || subject == "" || utf8.RuneCountInString(subject) > 200 {
+		return invalid("subject must contain 1 to 200 valid Unicode characters")
+	}
+	if body := strings.TrimSpace(opts.BodyMD); !utf8.ValidString(body) || body == "" || utf8.RuneCountInString(body) > 50000 {
+		return invalid("message body must contain 1 to 50,000 valid Unicode characters")
+	}
+	if !utf8.ValidString(opts.ThreadID) {
+		return invalid("thread_id must contain valid Unicode characters")
+	}
+	opts.ThreadID = strings.TrimSpace(opts.ThreadID)
+
+	// Normalize a copy, so repeated names neither duplicate a legacy delivery nor
+	// require multiple-recipient confirmation for a single effective recipient.
+	recipients := make([]string, 0, len(opts.Recipients))
+	seen := make(map[string]bool, len(opts.Recipients))
+	for _, recipient := range opts.Recipients {
+		name := strings.TrimSpace(recipient)
+		if name == "" || !utf8.ValidString(name) {
+			return invalid("recipient names must be nonempty valid Unicode strings")
+		}
+		key := strings.ToLower(name)
+		if !seen[key] {
+			recipients = append(recipients, name)
+			seen[key] = true
+		}
+	}
+	if len(recipients) == 0 || len(recipients) > 100 {
+		return invalid("between 1 and 100 recipients must be specified")
+	}
+	opts.Recipients = recipients
+
+	// Resolve the server's slug instead of guessing a potentially different
+	// project's identity from its filesystem path.
+	if opts.ProjectSlug == "" {
+		project, err := c.EnsureProject(ctx, opts.ProjectKey)
+		if err != nil {
+			return nil, fmt.Errorf("resolving overseer project: %w", err)
+		}
+		if project.Slug == "" {
+			return invalid("server returned no project slug for overseer delivery")
+		}
+		opts.ProjectSlug = project.Slug
+	}
+	result, err := c.sendOverseerMessageHTTP(ctx, opts)
+	if err == nil || !errors.Is(err, ErrNotImplemented) || opts.ProjectKey == "" {
+		return result, err
+	}
+	legacyToken := c.RegistrationToken(opts.ProjectKey, HumanOverseerAgentName)
+	if strings.TrimSpace(legacyToken) == "" {
+		return nil, fmt.Errorf("overseer intervention route unavailable and no existing authorized HumanOverseer identity is configured: %w", err)
 	}
 
-	// 1. Ensure project — idempotent, cheap, and gets us a stable
-	//    handle the server understands even if this is the very first
-	//    overseer call against this project.
-	if _, err := c.EnsureProject(ctx, projectKey); err != nil {
-		// EnsureProject failure isn't fatal for the overseer flow on
-		// older servers that auto-create on first message, so we
-		// don't return here — but record it for diagnostics if MCP
-		// itself also fails below.
-		_ = err
-	}
-
-	// 2. Register / re-claim the HumanOverseer agent. This is
-	//    idempotent on the server and gives us a registration_token
-	//    (cached automatically via rememberRegistrationToken).
-	if _, err := c.RegisterAgent(ctx, RegisterAgentOptions{
-		ProjectKey:      projectKey,
-		Name:            HumanOverseerAgentName,
-		Program:         "ntm",
-		Model:           "human",
-		TaskDescription: "Out-of-band instructions from the human operator",
-	}); err != nil {
-		// Fall back to the legacy HTTP endpoint when MCP registration
-		// fails outright (e.g. older server without identity support).
-		return c.sendOverseerMessageHTTP(ctx, opts)
-	}
-
-	body := HumanOverseerPreamble + opts.BodyMD
-	send, err := c.SendMessage(ctx, SendMessageOptions{
-		ProjectKey: projectKey,
+	// Only an absent route and an already authorized legacy identity permit this
+	// compatibility path. The server must still validate its existing sender token.
+	// A scoped client also prevents redirected MCP sends from replaying this
+	// mutation, without changing another caller's transport or MCP session.
+	legacyClient := NewClient(WithBaseURL(c.baseURL), WithToken(c.bearerToken))
+	legacyClient.httpClient = c.overseerHTTPClient()
+	legacyClient.SetRegistrationToken(opts.ProjectKey, HumanOverseerAgentName, legacyToken)
+	body := HumanOverseerPreamble + "Human intervention reason: " + opts.Reason + "\n\n" + opts.BodyMD
+	send, err := legacyClient.SendMessage(ctx, SendMessageOptions{
+		ProjectKey: opts.ProjectKey,
 		SenderName: HumanOverseerAgentName,
 		To:         opts.Recipients,
 		Subject:    opts.Subject,
@@ -897,50 +921,53 @@ func (c *Client) SendOverseerMessage(ctx context.Context, opts OverseerMessageOp
 		ThreadID:   opts.ThreadID,
 	})
 	if err != nil {
-		// MCP route refused (e.g. server doesn't allow a Human-Overseer
-		// agent and there's no contact yet). Try the HTTP endpoint as
-		// a last resort — operators running newer servers won't take
-		// this branch.
-		if httpResult, httpErr := c.sendOverseerMessageHTTP(ctx, opts); httpErr == nil {
-			return httpResult, nil
-		}
-		return nil, err
+		return nil, fmt.Errorf("legacy overseer send requires an existing authorized HumanOverseer identity; use a server with the overseer intervention route: %w", err)
 	}
 
-	// Map send_message's SendResult (per-recipient deliveries) onto
-	// OverseerSendResult so the CLI's output shape is unchanged.
-	result := &OverseerSendResult{
-		Success:    true,
-		Recipients: opts.Recipients,
+	// Preserve actual delivery evidence. An empty, partial, or inconsistent MCP
+	// receipt must not become a success for the originally requested recipients.
+	result = &OverseerSendResult{
+		Success: len(send.Deliveries) > 0,
 	}
 	for _, d := range send.Deliveries {
-		if d.Payload == nil {
+		if d.Payload == nil || d.Payload.ID <= 0 {
+			result.Success = false
 			continue
 		}
 		if result.MessageID == 0 {
 			result.MessageID = d.Payload.ID
+		} else if result.MessageID != d.Payload.ID {
+			result.Success = false
 		}
 		if !d.Payload.CreatedTS.IsZero() && result.SentAt.IsZero() {
 			result.SentAt = d.Payload.CreatedTS
 		}
+		result.Recipients = append(result.Recipients, d.Payload.To...)
 	}
-	return result, nil
+	return result, validateOverseerReceipt(result, opts.Recipients, 0)
 }
 
-// sendOverseerMessageHTTP is the legacy HTTP REST path. Kept for
-// back-compat against older servers that still expose
-// `/mail/{slug}/overseer/send`. Newer deployments (the v2.13.x line
-// the #146 reporter is on) typically 404 here.
-func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
-	if opts.ProjectSlug == "" {
-		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("project_slug required for HTTP fallback path"))
+// overseerHTTPClient retains the configured transport and timeout but forbids
+// redirected sends. Copying the HTTP client avoids changing concurrent callers.
+func (c *Client) overseerHTTPClient() *http.Client {
+	client := *c.httpClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
+	return &client
+}
 
+// sendOverseerMessageHTTP leaves identity provisioning, policy bypass, preamble,
+// importance, and audit recording to the server's designated intervention route.
+func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
 	// Build request body
 	reqBody := map[string]interface{}{
-		"recipients": opts.Recipients,
-		"subject":    opts.Subject,
-		"body_md":    opts.BodyMD,
+		"intent":           "human_overseer_send",
+		"reason":           opts.Reason,
+		"confirm_multiple": len(opts.Recipients) > 1,
+		"recipients":       opts.Recipients,
+		"subject":          opts.Subject,
+		"body_md":          opts.BodyMD,
 	}
 	if opts.ThreadID != "" {
 		reqBody["thread_id"] = opts.ThreadID
@@ -956,56 +983,114 @@ func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessa
 	// Encode path segments to ensure valid URL
 	url := fmt.Sprintf("%s/mail/%s/overseer/send", httpBaseURL, url.PathEscape(opts.ProjectSlug))
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, NewAPIError("overseer_send", 0, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	if c.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// A redirected POST must not become a GET or replay the intervention at a
+	// different authorization surface.
+	resp, err := c.overseerHTTPClient().Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, NewAPIError("overseer_send", 0, ErrTimeout)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, NewAPIError("overseer_send", 0, ctx.Err())
 		}
-		return nil, NewAPIError("overseer_send", 0, ErrServerUnavailable)
+		var netErr net.Error
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %w", ErrTimeout, err))
+		}
+		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %w", ErrServerUnavailable, err))
 	}
 	defer resp.Body.Close()
 
-	// Read response body (limit to 10MB to prevent DoS/OOM)
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	// Read one extra byte so an oversized response is explicitly ambiguous,
+	// never mistaken for an absent route after silently truncating its error.
+	const maxResponseBody = 10 << 20
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
 	if err != nil {
-		return nil, NewAPIError("overseer_send", 0, err)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, NewAPIError("overseer_send", 0, ctx.Err())
+		}
+		var netErr net.Error
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %w", ErrTimeout, err))
+		}
+		return nil, responseBodyReadError(ctx, "overseer_send", err)
+	}
+	if len(respBody) > maxResponseBody {
+		return nil, NewAPIError("overseer_send", resp.StatusCode, errors.New("overseer response exceeds 10 MiB (send was not retried; inspect the inbox before resending)"))
 	}
 
-	// Check HTTP status
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, NewAPIError("overseer_send", resp.StatusCode, ErrUnauthorized)
-	}
-	if resp.StatusCode == http.StatusBadRequest {
-		// Try to extract error message from response
-		var errResp struct {
-			Detail string `json:"detail"`
-		}
-		if json.Unmarshal(respBody, &errResp) == nil && errResp.Detail != "" {
-			return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("%s", errResp.Detail))
-		}
-		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("bad request"))
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
+		message := strings.ToLower(resp.Status)
+		if detail := httpErrorDetail(respBody); detail != "" {
+			message += ": " + detail
+		}
+		cause := error(nil)
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			cause = ErrUnauthorized
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			cause = ErrInvalidRequest
+		case http.StatusNotFound, http.StatusMethodNotAllowed:
+			// A structured rejection may mean an unknown project or a policy
+			// denial, rather than an absent route. Malformed or truncated JSON
+			// is ambiguous too, regardless of the advertised content type.
+			trimmed := bytes.TrimSpace(respBody)
+			looksJSON := len(trimmed) > 0 && strings.ContainsRune("{[\"", rune(trimmed[0]))
+			isJSON := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json")
+			if !json.Valid(respBody) && !looksJSON && !isJSON {
+				cause = ErrNotImplemented
+			} else if resp.StatusCode == http.StatusNotFound {
+				cause = ErrNotFound
+			}
+		}
+		if cause != nil {
+			return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("%w: %s", cause, message))
+		}
+		return nil, NewAPIError("overseer_send", resp.StatusCode, errors.New(message))
 	}
 
 	// Parse response
 	var result OverseerSendResult
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, NewAPIError("overseer_send", 0, err)
+		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("invalid delivery receipt (send was not retried): %w", err))
 	}
+	if !result.Success || result.MessageID <= 0 {
+		message := "server did not confirm overseer delivery (send was not retried)"
+		if detail := httpErrorDetail(respBody); detail != "" {
+			message += ": " + detail
+		}
+		return &result, NewAPIError("overseer_send", resp.StatusCode, errors.New(message))
+	}
+	return &result, validateOverseerReceipt(&result, opts.Recipients, resp.StatusCode)
+}
 
-	return &result, nil
+func validateOverseerReceipt(result *OverseerSendResult, recipients []string, statusCode int) error {
+	if !result.Success || result.MessageID <= 0 {
+		return NewAPIError("overseer_send", statusCode, fmt.Errorf("server did not confirm overseer delivery (send was not retried; inspect the inbox before resending)"))
+	}
+	// Python servers can return success after silently dropping unknown names.
+	// Keep the actual receipt and report incomplete/unexpected delivery instead
+	// of claiming every selected recipient was reached or retrying the message.
+	delivered := make(map[string]bool, len(result.Recipients))
+	for _, name := range result.Recipients {
+		delivered[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	complete := len(delivered) == len(recipients) && len(delivered) == len(result.Recipients)
+	for _, name := range recipients {
+		complete = complete && delivered[strings.ToLower(name)]
+	}
+	if !complete {
+		return NewAPIError("overseer_send", statusCode, fmt.Errorf("message %d delivery mismatch: requested %v; server reported %v (send was not retried; inspect the inbox before resending)", result.MessageID, recipients, result.Recipients))
+	}
+	return nil
 }
 
 // ListProjectAgents lists all agents registered in a project.

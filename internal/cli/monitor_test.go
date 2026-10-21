@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,6 +26,94 @@ import (
 type recordingAccountRotationRunner struct {
 	run   func(context.Context) []coordinator.AccountFailoverDecision
 	close func() error
+}
+
+func TestAccountRotationSessionIdentityRejectsMalformedEvidence(t *testing.T) {
+	_, dir := accountRotationMonitorFixture(t)
+	for _, name := range []string{"", ":", "$1", "%1", "cc_agents_1:0", "=cc_agents_1"} {
+		if _, err := accountRotationSessionIdentity(t.Context(), name); err == nil {
+			t.Fatalf("accepted ambiguous session target %q", name)
+		}
+	}
+	for _, value := range []string{"", "0:$1:1770000000", "700:1:1770000000", "700:$1:0", "700:$1:1770000000\n700:$2:1770000000", "-1:$1:1770000000"} {
+		if err := os.WriteFile(filepath.Join(dir, "identity"), []byte(value), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := accountRotationSessionIdentity(t.Context(), "cc_agents_1"); err == nil {
+			t.Fatalf("accepted identity %q", value)
+		}
+	}
+}
+
+func TestAccountRotationMonitorRealTmux(t *testing.T) {
+	bin, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("real tmux unavailable")
+	}
+	dir := t.TempDir()
+	// Isolate the server, including its configuration and environment, from
+	// any operator sessions. A spare session keeps the server PID unchanged
+	// while the monitored name is replaced.
+	wrapper := filepath.Join(dir, "tmux")
+	socket := filepath.Join(dir, "socket")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec "+tmux.ShellQuote(bin)+" -S "+tmux.ShellQuote(socket)+" -f /dev/null \"$@\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", wrapper)
+	oldClient, oldRunner, oldPreflight := tmux.DefaultClient, newAccountRotationRunner, swarmPreflightAccountRotation
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() {
+		_, _ = tmux.DefaultClient.Run("kill-server")
+		tmux.DefaultClient, newAccountRotationRunner, swarmPreflightAccountRotation = oldClient, oldRunner, oldPreflight
+	})
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := tmux.DefaultClient.Run(args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if _, err := tmux.DefaultClient.Run("new-session", "-d", "-s", "spare"); err != nil {
+		if strings.Contains(err.Error(), "Operation not permitted") {
+			t.Skipf("host prohibits tmux server sockets: %v", err)
+		}
+		t.Fatal(err)
+	}
+	run("new-session", "-d", "-s", "rotation")
+	pane := run("display-message", "-p", "-t", "=rotation:", "#{pane_id}")
+	run("select-pane", "-t", pane, "-T", "rotation__cc_1")
+	run("set-option", "-p", "-t", pane, "@ntm_agent_type", "cc")
+	identity, err := accountRotationSessionIdentity(t.Context(), "rotation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accountRotationSessionIdentity(t.Context(), "rot"); err == nil {
+		t.Fatal("prefix target accepted")
+	}
+	manifest := &resilience.SpawnManifest{Session: "rotation", SessionIdentity: identity, ProjectDir: dir,
+		Agents:          []resilience.AgentConfig{{PaneID: pane, Type: "cc", ProjectDir: dir}},
+		AccountRotation: &resilience.RotationMonitorOptions{Providers: []string{"claude"}, PollSeconds: 1}}
+	swarmPreflightAccountRotation = func(context.Context, config.CAAMConfig) error { return nil }
+	ran, closed, ready := false, false, false
+	newAccountRotationRunner = func(string, coordinator.AccountFailoverOptions) (accountRotationRunner, error) {
+		return recordingAccountRotationRunner{run: func(context.Context) []coordinator.AccountFailoverDecision { ran = true; return nil }, close: func() error { closed = true; return nil }}, nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = runAccountRotationMonitor(ctx, manifest, func(context.Context, io.ReadCloser) error {
+		ready = true
+		run("kill-session", "-t", "=rotation")
+		run("new-session", "-d", "-s", "rotation")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "replaced") || !ready || ran || !closed {
+		t.Fatalf("replacement lifecycle: err=%v ready=%v ran=%v closed=%v", err, ready, ran, closed)
+	}
+	newIdentity, err := accountRotationSessionIdentity(t.Context(), "rotation")
+	if err != nil || newIdentity == identity {
+		t.Fatalf("replacement identity=%q old=%q error=%v", newIdentity, identity, err)
+	}
 }
 
 func (r recordingAccountRotationRunner) RunOnce(ctx context.Context) []coordinator.AccountFailoverDecision {
@@ -232,6 +321,38 @@ func TestAccountRotationMonitorRejectsChangedScopeBeforeAcknowledgment(t *testin
 				t.Fatalf("changed startup scope accepted: err=%v acknowledged=%t ran=%t", err, acknowledged, ran)
 			}
 		})
+	}
+}
+
+func TestAccountRotationMonitorPassesLiveScopeGuardToRecovery(t *testing.T) {
+	manifest, dir := accountRotationMonitorFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	checked := false
+	newAccountRotationRunner = func(_ string, options coordinator.AccountFailoverOptions) (accountRotationRunner, error) {
+		if options.ValidateScope == nil {
+			t.Fatal("resident recovery has no scope guard")
+		}
+		return recordingAccountRotationRunner{run: func(ctx context.Context) []coordinator.AccountFailoverDecision {
+			if err := options.ValidateScope(ctx); err != nil {
+				t.Errorf("original session refused: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "identity"), []byte("701:$1:1770000000"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := options.ValidateScope(ctx); err == nil {
+				t.Error("scope guard reused the pre-poll identity after server replacement")
+			}
+			checked = true
+			cancel()
+			return nil
+		}}, nil
+	}
+	if err := runAccountRotationMonitor(ctx, manifest, func(context.Context, io.ReadCloser) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !checked {
+		t.Fatal("recovery runner was not exercised")
 	}
 }
 
